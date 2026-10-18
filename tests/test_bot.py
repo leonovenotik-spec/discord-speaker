@@ -35,6 +35,20 @@ class MuteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.member.edit.await_args_list[-1].kwargs["mute"], False)
         self.assertIsNone(self.journal.read())
 
+    async def test_shutdown_cancellation_is_preserved_when_member_disconnected(self):
+        started = asyncio.Event()
+        async def playback():
+            async with bot.muted_for_speech(self.member, self.journal):
+                started.set()
+                await asyncio.Event().wait()
+        task = asyncio.create_task(playback())
+        await started.wait()
+        self.member.voice = None
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertIsNotNone(self.journal.read())
+
     async def test_never_removes_existing_mute(self):
         self.member.voice.mute = True
         with self.assertRaises(bot.UserError):

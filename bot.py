@@ -49,11 +49,20 @@ async def muted_for_speech(member, journal):
     if member.voice.mute:
         raise UserError("На тебе уже стоит серверный мут. Сначала сними его вручную.")
     journal.record(member)
+    cancelled = False
     try:
         await member.edit(mute=True, reason="TTS: микрофон выключен на время озвучки")
         yield
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     finally:
-        await journal.restore(member.guild, member.id)
+        try:
+            await journal.restore(member.guild, member.id)
+        except Exception:
+            if not cancelled:
+                raise
+            log.warning("Microphone recovery pending after cancellation")
 
 
 async def play_audio(voice, source):
@@ -366,7 +375,7 @@ class Speaker(discord.Client):
 
     async def message_worker(self, guild):
         state = self.state(guild.id)
-        while True:
+        while not self.shutting_down:
             message, channel_id = await state.message_queue.get()
             try:
                 async with state.lock:
@@ -377,11 +386,12 @@ class Speaker(discord.Client):
                         continue
                     result = await perform_speech(self, guild, member, message.clean_content,
                                                   expected_channel_id=channel_id)
-                if result != "Готово.":
+                if result != "Готово." and not self.shutting_down:
                     await self.reply_message_error(message, result)
             except Exception as exc:
                 log.warning("Queued speech failed (%s)", type(exc).__name__)
-                await self.reply_message_error(message, "Не удалось озвучить сообщение. Проверь голосовой канал и права бота.")
+                if not self.shutting_down:
+                    await self.reply_message_error(message, "Не удалось озвучить сообщение. Проверь голосовой канал и права бота.")
             finally:
                 state.message_queue.task_done()
 
