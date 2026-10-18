@@ -46,7 +46,7 @@ class MuteTests(unittest.IsolatedAsyncioTestCase):
     async def test_recovery_survives_restart(self):
         self.journal.record(self.member)
         reopened = bot.MuteJournal(self.temp.name)
-        await reopened.restore(self.guild)
+        await reopened.restore(self.guild, self.member.id)
         self.member.edit.assert_awaited_once()
         self.assertIsNone(reopened.read())
 
@@ -54,29 +54,29 @@ class MuteTests(unittest.IsolatedAsyncioTestCase):
         self.journal.record(self.member)
         self.member.voice = None
         with self.assertRaises(bot.UserError):
-            await self.journal.restore(self.guild)
+            await self.journal.restore(self.guild, self.member.id)
         self.assertIsNotNone(self.journal.read())
         self.member.edit.assert_not_awaited()
 
-    async def test_changed_owner_is_not_unmuted(self):
+    async def test_wrong_member_is_not_unmuted(self):
         self.journal.record(self.member)
-        self.guild.owner_id = 999
+        self.member.id = 999
         with self.assertRaises(bot.UserError):
-            await self.journal.restore(self.guild)
+            await self.journal.restore(self.guild, self.member.id)
         self.member.edit.assert_not_awaited()
 
     async def test_failed_restore_keeps_journal(self):
         self.journal.record(self.member)
         self.member.edit.side_effect = RuntimeError("network")
         with self.assertRaises(RuntimeError):
-            await self.journal.restore(self.guild)
+            await self.journal.restore(self.guild, self.member.id)
         self.assertIsNotNone(self.journal.read())
 
     async def test_command_registration(self):
-        client = bot.Speaker(123, self.temp.name)
+        client = bot.Speaker(self.temp.name)
         with patch.object(client.tree, "sync", new=AsyncMock()):
             await client.setup_hook()
-        self.assertEqual({x.name for x in client.tree.get_commands()}, {"say", "stop", "restore", "panel"})
+        self.assertEqual({x.name for x in client.tree.get_commands()}, {"say", "stop", "restore", "panel", "access"})
 
     async def test_preferences_survive_restart(self):
         prefs = bot.Preferences(self.temp.name)
@@ -93,9 +93,9 @@ class MuteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.Preferences(self.temp.name).speed, "-15%")
 
     async def test_panel_shows_saved_voice_and_speed(self):
-        client = bot.Speaker(123, self.temp.name)
-        client.preferences.set(voice="en-US-AvaMultilingualNeural", speed="-30%")
-        view = bot.ControlPanel(client)
+        client = bot.Speaker(self.temp.name)
+        client.state(123).member(456).preferences.set(voice="en-US-AvaMultilingualNeural", speed="-30%")
+        view = bot.ControlPanel(client, 123, 456)
         menus = [item for item in view.children if isinstance(item, bot.PreferenceSelect)]
         selected = {menu.kind: [option.value for option in menu.options if option.default] for menu in menus}
         self.assertEqual(selected, {"voice": ["en-US-AvaMultilingualNeural"], "speed": ["-30%"]})
@@ -112,8 +112,8 @@ class MuteTests(unittest.IsolatedAsyncioTestCase):
         handler.assert_awaited_once_with(interaction, text="Проверка кнопки")
 
     async def test_panel_denies_other_members(self):
-        client = bot.Speaker(123, self.temp.name)
-        view = bot.ControlPanel(client)
+        client = bot.Speaker(self.temp.name)
+        view = bot.ControlPanel(client, 123, 456)
         interaction = SimpleNamespace(client=client, guild=self.guild,
             user=SimpleNamespace(id=999), response=SimpleNamespace(send_message=AsyncMock()))
         self.assertFalse(await view.interaction_check(interaction))
