@@ -76,7 +76,7 @@ class MuteTests(unittest.IsolatedAsyncioTestCase):
         client = bot.Speaker(self.temp.name)
         with patch.object(client.tree, "sync", new=AsyncMock()):
             await client.setup_hook()
-        self.assertEqual({x.name for x in client.tree.get_commands()}, {"say", "stop", "restore", "panel", "access"})
+        self.assertEqual({x.name for x in client.tree.get_commands()}, {"say", "stop", "restore", "panel", "access", "leave", "textchannel"})
 
     async def test_preferences_survive_restart(self):
         prefs = bot.Preferences(self.temp.name)

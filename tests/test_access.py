@@ -23,7 +23,7 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         member = SimpleNamespace(id=user_id, guild=guild,
             guild_permissions=discord.Permissions(manage_guild=manager),
             roles=[SimpleNamespace(id=role) for role in roles],
-            voice=None, edit=AsyncMock())
+            voice=None, edit=AsyncMock(), bot=False)
         guild.fetch_member = AsyncMock(return_value=member)
         return SimpleNamespace(client=self.client, guild=guild, user=member, data={},
             response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock(),
@@ -33,11 +33,17 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
     def voice_interaction(self, guild_id=123, user_id=456):
         interaction = self.interaction(guild_id, user_id)
         channel = MagicMock(spec=discord.VoiceChannel)
+        channel.id = guild_id + 1000
         channel.permissions_for.return_value = SimpleNamespace(
             view_channel=True, connect=True, speak=True, mute_members=True)
-        connection = SimpleNamespace(channel=channel, disconnect=AsyncMock())
-        channel.connect = AsyncMock(return_value=connection)
+        connection = SimpleNamespace(channel=channel, disconnect=AsyncMock(), stop=Mock(),
+                                     is_connected=Mock(return_value=True))
+        async def connect(**kwargs):
+            interaction.guild.voice_client = connection
+            return connection
+        channel.connect = AsyncMock(side_effect=connect)
         interaction.user.voice = SimpleNamespace(channel=channel, mute=False)
+        channel.members = [interaction.user]
         interaction.guild.me = object()
         return interaction, connection
 
@@ -155,7 +161,7 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sync.await_args_list[1].kwargs["guild"].id, 123)
         self.assertEqual(published[0], (None, []))
         self.assertEqual(published[1][1], [])
-        self.assertEqual(len(client.tree.get_commands()), 5)
+        self.assertEqual(len(client.tree.get_commands()), 7)
 
     async def test_join_registers_server_commands_without_repeating_on_reconnect(self):
         guild = SimpleNamespace(id=123)
@@ -166,7 +172,7 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
             await self.client.sync_guild_commands(guild)
             sync.assert_awaited_once_with(guild=guild)
             self.assertEqual({command.name for command in self.client.tree.get_commands(guild=guild)},
-                             {"say", "stop", "restore", "panel", "access"})
+                             {"say", "stop", "restore", "panel", "access", "leave", "textchannel"})
             await self.client.on_guild_remove(guild)
             await self.client.on_guild_join(guild)
             self.assertEqual(sync.await_count, 2)
@@ -185,7 +191,7 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         interaction, connection = self.voice_interaction(user_id=777)
         source = SimpleNamespace(cleanup=Mock())
         with patch.object(bot.edge_tts, "Communicate", return_value=SimpleNamespace(save=AsyncMock())), \
-             patch.object(bot.discord.FFmpegOpusAudio, "from_probe", new=AsyncMock(return_value=source)), \
+             patch.object(bot.discord, "FFmpegOpusAudio", return_value=source), \
              patch.object(bot, "play_audio", new=AsyncMock()) as play:
             await bot.say.callback(interaction, text="Привет")
         play.assert_awaited_once_with(connection, source)
@@ -201,7 +207,7 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         interaction.guild.fetch_member.return_value = fresh
         with patch.object(bot.edge_tts, "Communicate", return_value=SimpleNamespace(save=AsyncMock())):
             await bot.say.callback(interaction, text="Привет")
-        interaction.user.voice.channel.connect.assert_not_awaited()
+        interaction.user.voice.channel.connect.assert_awaited_once()
         interaction.user.edit.assert_not_awaited()
 
     async def test_two_servers_can_speak_independently(self):
@@ -214,13 +220,13 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
                 await release.wait()
         source = SimpleNamespace(cleanup=Mock())
         with patch.object(bot.edge_tts, "Communicate", return_value=SimpleNamespace(save=AsyncMock())), \
-             patch.object(bot.discord.FFmpegOpusAudio, "from_probe", new=AsyncMock(return_value=source)), \
+             patch.object(bot.discord, "FFmpegOpusAudio", return_value=source), \
              patch.object(bot, "play_audio", new=play):
             task = asyncio.create_task(bot.say.callback(first, text="Первая фраза"))
             try:
                 await asyncio.wait_for(started.wait(), 2)
                 await asyncio.wait_for(bot.say.callback(second, text="Вторая фраза"), 2)
-                second_connection.disconnect.assert_awaited_once()
+                second_connection.disconnect.assert_not_awaited()
                 self.assertTrue(self.client.state(123).lock.locked())
             finally:
                 release.set()

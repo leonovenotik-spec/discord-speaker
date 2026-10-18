@@ -62,6 +62,7 @@ class ServerSettings:
     def __init__(self, folder):
         self.path = Path(folder) / "settings.json"
         self.role_id = None
+        self.text_channel_id = None
         if self.path.exists():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -69,6 +70,10 @@ class ServerSettings:
                 if role_id is not None and (type(role_id) is not int or role_id <= 0):
                     raise ValueError("Invalid role")
                 self.role_id = role_id
+                channel_id = data.get("text_channel_id")
+                if channel_id is not None and (type(channel_id) is not int or channel_id <= 0):
+                    raise ValueError("Invalid text channel")
+                self.text_channel_id = channel_id
             except (ValueError, KeyError, TypeError, OSError):
                 # An unreadable access policy must not silently open access to everyone.
                 raise UserError("Настройки доступа сервера повреждены. Обратись к владельцу бота.") from None
@@ -76,8 +81,14 @@ class ServerSettings:
     def set_role(self, role_id):
         if role_id is not None and (type(role_id) is not int or role_id <= 0):
             raise UserError("Некорректная роль.")
-        write_json(self.path, {"role_id": role_id})
+        write_json(self.path, {"role_id": role_id, "text_channel_id": self.text_channel_id})
         self.role_id = role_id
+
+    def set_text_channel(self, channel_id):
+        if channel_id is not None and (type(channel_id) is not int or channel_id <= 0):
+            raise UserError("Некорректный текстовый канал.")
+        write_json(self.path, {"role_id": self.role_id, "text_channel_id": channel_id})
+        self.text_channel_id = channel_id
 
 
 class MuteJournal:
@@ -134,6 +145,11 @@ class GuildState:
         self.lock = asyncio.Lock()
         self.cancel = asyncio.Event()
         self.active_user_id = None
+        self.session_owner_id = None
+        self.session_channel_id = None
+        self.session_ending = False
+        self.message_queue = asyncio.Queue(maxsize=20)
+        self.worker_task = None
         self.members = {}
 
     def member(self, user_id):

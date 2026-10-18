@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+import time
 
 import discord
 from discord import app_commands
@@ -27,6 +28,9 @@ def can_speak(guild, member, settings):
 
 
 async def require_access(interaction, *, recovery=False):
+    if interaction.client.shutting_down:
+        await interaction.response.send_message("Бот перезапускается. Повтори команду немного позже.", ephemeral=True)
+        return False
     if interaction.guild is None:
         await interaction.response.send_message("Эта команда работает на сервере Discord.", ephemeral=True)
         return False
@@ -70,14 +74,166 @@ async def play_audio(voice, source):
         voice.stop()
 
 
+def clear_message_queue(state):
+    while not state.message_queue.empty():
+        state.message_queue.get_nowait()
+        state.message_queue.task_done()
+
+
+async def disconnect_session(guild, state):
+    state.session_ending = True
+    state.cancel.set()
+    state.session_owner_id = None
+    state.session_channel_id = None
+    clear_message_queue(state)
+    connection = guild.voice_client
+    try:
+        if connection:
+            connection.stop()
+            await connection.disconnect(force=True)
+    except (discord.HTTPException, discord.ClientException):
+        log.warning("Voice disconnect failed")
+    finally:
+        state.session_ending = False
+
+
+async def wait_or_cancel(awaitable, cancel_event, timeout):
+    task = asyncio.ensure_future(awaitable)
+    cancellation = asyncio.create_task(cancel_event.wait())
+    try:
+        done, _ = await asyncio.wait((task, cancellation), timeout=timeout,
+                                     return_when=asyncio.FIRST_COMPLETED)
+        if cancellation in done:
+            raise UserError("Озвучка отменена.")
+        if task not in done:
+            raise TimeoutError("Speech preparation timed out")
+        return await task
+    finally:
+        for pending in (task, cancellation):
+            if not pending.done():
+                pending.cancel()
+        await asyncio.gather(task, cancellation, return_exceptions=True)
+
+
+async def ensure_connection(guild, member, channel, state):
+    connection = guild.voice_client
+    if connection and not connection.is_connected():
+        await connection.disconnect(force=True)
+        connection = None
+    if connection:
+        if connection.channel != channel:
+            raise UserError("Бот уже занят в другом голосовом канале. Дождись выхода вызвавшего его участника.")
+        if state.session_owner_id is None:
+            state.session_owner_id = member.id
+            state.session_channel_id = channel.id
+        return connection
+    if not member.voice or member.voice.channel != channel:
+        raise UserError("Ты уже вышел из голосового канала.")
+    state.session_owner_id = member.id
+    state.session_channel_id = channel.id
+    try:
+        connection = await channel.connect(timeout=30, reconnect=True, self_deaf=True)
+        if state.cancel.is_set():
+            raise UserError("Озвучка отменена.")
+        return connection
+    except (Exception, asyncio.CancelledError):
+        await disconnect_session(guild, state)
+        raise
+
+
+async def perform_speech(client, guild, member, text, *, voice=None, speed=None,
+                         expected_channel_id=None, on_started=None):
+    """Caller holds the guild lock; text is kept in memory only for this request."""
+    state = client.state(guild.id)
+    if state.session_ending or client.shutting_down:
+        return "Сеанс завершается. Повтори сообщение после выхода бота."
+    state.active_user_id = member.id
+    state.cancel.clear()
+    user_state = state.member(member.id)
+    connect_task = None
+    message = "Готово."
+    start = time.monotonic()
+    try:
+        if user_state.journal.read():
+            await user_state.journal.restore(guild, member.id)
+        channel = member.voice.channel if member.voice else None
+        if not isinstance(channel, discord.VoiceChannel):
+            raise UserError("Зайди в обычный голосовой канал. Трибуны не поддерживаются.")
+        if expected_channel_id is not None and channel.id != expected_channel_id:
+            raise UserError("Ты сменил голосовой канал; сообщение из очереди пропущено.")
+        if not can_speak(guild, member, state.settings):
+            raise UserError("Для озвучки нужна роль, выбранная администратором сервера.")
+        permissions = channel.permissions_for(guild.me)
+        if not all((permissions.view_channel, permissions.connect, permissions.speak, permissions.mute_members)):
+            raise UserError("Выдай боту права: видеть канал, подключаться, говорить и отключать микрофон участникам.")
+        if not text.strip() or len(text) > 500:
+            raise UserError("Напиши от 1 до 500 символов для озвучки.")
+        if voice is not None or speed is not None:
+            user_state.preferences.set(voice=voice, speed=speed)
+        with tempfile.TemporaryDirectory(prefix="speaker-") as folder, ExitStack() as cleanup:
+            path = Path(folder) / "speech.mp3"
+            # The first connection and synthesis overlap; subsequent phrases reuse voice.
+            connect_task = asyncio.create_task(ensure_connection(guild, member, channel, state))
+            synth_start = time.monotonic()
+            await wait_or_cancel(edge_tts.Communicate(
+                text.strip(), voice=user_state.preferences.voice, rate=user_state.preferences.speed
+            ).save(str(path)), state.cancel, timeout=45)
+            synth_seconds = time.monotonic() - synth_start
+            connection = await wait_or_cancel(connect_task, state.cancel, timeout=30)
+            if state.cancel.is_set():
+                raise UserError("Озвучка отменена.")
+            member = await guild.fetch_member(member.id)
+            if not can_speak(guild, member, state.settings):
+                raise UserError("Доступ к озвучке изменился. Обратись к администратору сервера.")
+            if not member.voice or member.voice.channel != channel:
+                raise UserError("Ты сменил канал. Повтори команду в новом канале.")
+            # The input format is known (MP3): no extra probing subprocess is needed.
+            source = discord.FFmpegOpusAudio(str(path), executable=client.ffmpeg_executable)
+            cleanup.callback(source.cleanup)
+            if state.cancel.is_set():
+                raise UserError("Озвучка отменена.")
+            if on_started:
+                try:
+                    await on_started()
+                except discord.HTTPException:
+                    pass
+            log.info("Speech ready in %.2fs (synthesis %.2fs)", time.monotonic() - start, synth_seconds)
+            async with muted_for_speech(member, user_state.journal):
+                if state.cancel.is_set():
+                    raise UserError("Озвучка отменена.")
+                await play_audio(connection, source)
+            if state.cancel.is_set():
+                message = "Озвучка остановлена. Микрофон восстановлен."
+    except UserError as exc:
+        message = str(exc)
+    except discord.Forbidden:
+        message = "Discord отклонил действие. Проверь права бота в этом голосовом канале."
+    except Exception as exc:
+        log.warning("Speech failed (%s)", type(exc).__name__)
+        message = "Не удалось озвучить текст: проверь интернет и журнал хостинга."
+    finally:
+        if connect_task:
+            if not connect_task.done():
+                connect_task.cancel()
+            await asyncio.gather(connect_task, return_exceptions=True)
+        state.active_user_id = None
+        if user_state.journal.path.exists():
+            message += " Восстановление микрофона не завершено: зайди в голосовой канал и выполни /restore; либо сними серверный мут вручную."
+    return message
+
+
 class Speaker(discord.Client):
-    def __init__(self, data_dir, legacy_guild_id=None):
+    def __init__(self, data_dir, legacy_guild_id=None, *, message_content=False):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.voice_states = True
-        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
+        intents.guild_messages = True
+        intents.message_content = message_content
+        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none(), max_messages=None)
+        self.ffmpeg_executable = imageio_ffmpeg.get_ffmpeg_exe()
         self.data_dir = Path(data_dir)
         self.states = {}
+        self.shutting_down = False
         self.synced_guild_ids = set()
         self.legacy_guild_id = legacy_guild_id
         self.tree = app_commands.CommandTree(
@@ -106,7 +262,7 @@ class Speaker(discord.Client):
         # are published only per guild, so Discord cannot show both scope copies.
         self.tree.clear_commands(guild=None)
         await self.tree.sync()
-        for command in (say, stop, restore, panel, access):
+        for command in (say, stop, restore, panel, access, leave, textchannel):
             self.tree.add_command(command)
         if self.legacy_guild_id:
             old_guild = discord.Object(id=self.legacy_guild_id)
@@ -149,21 +305,102 @@ class Speaker(discord.Client):
                 await self.recover(guild)
             except Exception as exc:
                 log.warning("Guild recovery unavailable (%s)", type(exc).__name__)
-        log.info("READY: /panel, /say, /stop, /restore, /access are available")
+        log.info("READY: /panel, /say, /stop, /restore, /access, /leave, /textchannel are available")
 
     async def on_voice_state_update(self, member, before, after):
+        state = self.state(member.guild.id)
+        if before.channel != after.channel and state.session_channel_id is not None:
+            channel_id = state.session_channel_id
+            owner_left = (member.id == state.session_owner_id and before.channel is not None
+                          and before.channel.id == channel_id)
+            bot_moved = (self.user is not None and member.id == self.user.id
+                         and before.channel is not None and before.channel.id == channel_id)
+            channel = member.guild.get_channel(channel_id)
+            empty = channel is not None and not any(not person.bot for person in channel.members)
+            if owner_left or bot_moved or empty:
+                state.session_ending = True
+                state.cancel.set()
+                connection = member.guild.voice_client
+                if connection:
+                    connection.stop()
+                async with state.lock:
+                    await disconnect_session(member.guild, state)
         if after.channel and not before.channel:
-            state = self.state(member.guild.id)
             if not state.lock.locked() and state.member(member.id).journal.path.exists():
                 await self.recover(member.guild)
 
+    async def reply_message_error(self, message, result):
+        try:
+            await message.reply(result, mention_author=False)
+        except discord.HTTPException:
+            log.warning("Cannot send text-channel feedback")
+
+    async def on_message(self, message):
+        if (self.shutting_down or not self.intents.message_content or message.guild is None
+                or message.author.bot or message.webhook_id is not None):
+            return
+        state = self.state(message.guild.id)
+        if state.settings.text_channel_id != message.channel.id:
+            return
+        if state.session_ending:
+            return
+        text = message.clean_content.strip()
+        if not text or not can_speak(message.guild, message.author, state.settings):
+            return
+        channel = message.author.voice.channel if message.author.voice else None
+        if not isinstance(channel, discord.VoiceChannel):
+            return
+        if len(text) > 500:
+            await self.reply_message_error(message, "Для озвучки напиши не более 500 символов.")
+            return
+        if state.session_channel_id is not None and state.session_channel_id != channel.id:
+            await self.reply_message_error(message, "Бот уже работает в другом голосовом канале.")
+            return
+        try:
+            state.message_queue.put_nowait((message, channel.id))
+        except asyncio.QueueFull:
+            await self.reply_message_error(message, "Очередь заполнена. Подожди немного и повтори сообщение.")
+            return
+        if state.worker_task is None or state.worker_task.done():
+            state.worker_task = asyncio.create_task(self.message_worker(message.guild))
+
+    async def message_worker(self, guild):
+        state = self.state(guild.id)
+        while True:
+            message, channel_id = await state.message_queue.get()
+            try:
+                async with state.lock:
+                    if state.settings.text_channel_id != message.channel.id:
+                        continue
+                    member = await guild.fetch_member(message.author.id)
+                    if not can_speak(guild, member, state.settings):
+                        continue
+                    result = await perform_speech(self, guild, member, message.clean_content,
+                                                  expected_channel_id=channel_id)
+                if result != "Готово.":
+                    await self.reply_message_error(message, result)
+            except Exception as exc:
+                log.warning("Queued speech failed (%s)", type(exc).__name__)
+                await self.reply_message_error(message, "Не удалось озвучить сообщение. Проверь голосовой канал и права бота.")
+            finally:
+                state.message_queue.task_done()
+
     async def close(self):
+        self.shutting_down = True
+        for state in self.states.values():
+            state.cancel.set()
         for voice in list(self.voice_clients):
             voice.stop()
+        workers = [state.worker_task for state in self.states.values()
+                   if state.worker_task is not None and not state.worker_task.done()]
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
         try:
             for guild in self.guilds:
                 try:
                     await self.recover(guild)
+                    await disconnect_session(guild, self.state(guild.id))
                 except Exception as exc:
                     log.warning("Shutdown recovery pending (%s)", type(exc).__name__)
         finally:
@@ -182,82 +419,17 @@ async def say(interaction: discord.Interaction, text: app_commands.Range[str, 1,
         return
     client = interaction.client
     state = client.state(interaction.guild.id)
-    if state.lock.locked():
+    if state.lock.locked() or not state.message_queue.empty():
         await interaction.response.send_message(
             "На этом сервере уже готовится или звучит фраза. Дождись окончания.", ephemeral=True)
         return
     async with state.lock:
-        state.active_user_id = interaction.user.id
-        state.cancel.clear()
-        user_state = state.member(interaction.user.id)
-        connection = None
-        message = "Готово."
-        try:
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            if user_state.journal.read():
-                await user_state.journal.restore(interaction.guild, interaction.user.id)
-            member = interaction.user
-            channel = member.voice.channel if member.voice else None
-            if not isinstance(channel, discord.VoiceChannel):
-                raise UserError("Зайди в обычный голосовой канал. Трибуны не поддерживаются.")
-            permissions = channel.permissions_for(interaction.guild.me)
-            if not all((permissions.view_channel, permissions.connect, permissions.speak, permissions.mute_members)):
-                raise UserError("Выдай боту права: видеть канал, подключаться, говорить и отключать микрофон участникам.")
-            if not text.strip():
-                raise UserError("Напиши текст, который нужно произнести.")
-            if voice is not None or speed is not None:
-                user_state.preferences.set(voice=voice, speed=speed)
-            selected_voice = user_state.preferences.voice
-            selected_speed = user_state.preferences.speed
-            with tempfile.TemporaryDirectory(prefix="speaker-") as folder, ExitStack() as cleanup:
-                path = Path(folder) / "speech.mp3"
-                await asyncio.wait_for(edge_tts.Communicate(
-                    text.strip(), voice=selected_voice, rate=selected_speed).save(str(path)), timeout=60)
-                if state.cancel.is_set():
-                    raise UserError("Озвучка отменена.")
-                # Refresh both membership and role access after synthesis.
-                member = await interaction.guild.fetch_member(interaction.user.id)
-                if not can_speak(interaction.guild, member, state.settings):
-                    raise UserError("Доступ к озвучке изменился. Обратись к администратору сервера.")
-                if not member.voice or member.voice.channel != channel:
-                    raise UserError("Ты сменил канал. Повтори команду в новом канале.")
-                connection = interaction.guild.voice_client
-                if connection and connection.channel != channel:
-                    await connection.move_to(channel)
-                elif connection is None:
-                    connection = await channel.connect(timeout=30, reconnect=True, self_deaf=True)
-                source = await discord.FFmpegOpusAudio.from_probe(
-                    str(path), executable=imageio_ffmpeg.get_ffmpeg_exe(), method="fallback")
-                cleanup.callback(source.cleanup)
-                if state.cancel.is_set():
-                    raise UserError("Озвучка отменена.")
-                async with muted_for_speech(member, user_state.journal):
-                    if state.cancel.is_set():
-                        raise UserError("Озвучка отменена.")
-                    await play_audio(connection, source)
-                if state.cancel.is_set():
-                    message = "Озвучка остановлена. Микрофон восстановлен."
-        except UserError as exc:
-            message = str(exc)
-        except discord.Forbidden:
-            message = "Discord отклонил действие. Проверь права бота в этом голосовом канале."
-        except Exception as exc:
-            log.warning("Speech failed (%s)", type(exc).__name__)
-            message = "Не удалось озвучить текст: проверь интернет и журнал хостинга."
-        finally:
-            current = connection or interaction.guild.voice_client
-            if current:
-                try:
-                    await current.disconnect(force=True)
-                except Exception:
-                    log.warning("Voice disconnect failed")
-            state.active_user_id = None
-            if user_state.journal.path.exists():
-                message += " Восстановление микрофона не завершено: зайди в голосовой канал и выполни /restore; либо сними серверный мут вручную."
-        if interaction.response.is_done():
-            await interaction.edit_original_response(content=message)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async def started():
+            await interaction.edit_original_response(content="Озвучиваю…")
+        result = await perform_speech(client, interaction.guild, interaction.user, text,
+                                      voice=voice, speed=speed, on_started=started)
+        await interaction.edit_original_response(content=result)
 
 
 @app_commands.command(name="stop", description="Остановить свою озвучку; администратор может остановить любую")
@@ -277,6 +449,61 @@ async def stop(interaction: discord.Interaction):
     if connection:
         connection.stop()
     await interaction.response.send_message("Отмена запрошена. Бот восстановит микрофон после остановки.", ephemeral=True)
+
+
+@app_commands.command(name="leave", description="Отключить бота от голосового канала и очистить очередь")
+@app_commands.guild_only()
+async def leave(interaction: discord.Interaction):
+    if not await require_access(interaction, recovery=True):
+        return
+    state = interaction.client.state(interaction.guild.id)
+    if state.session_owner_id is None:
+        await interaction.response.send_message("Бот сейчас не находится в голосовом канале.", ephemeral=True)
+        return
+    if state.session_owner_id != interaction.user.id and not is_manager(interaction.guild, interaction.user):
+        await interaction.response.send_message("Выйти может попросить вызвавший бота участник или управляющий сервером.", ephemeral=True)
+        return
+    state.session_ending = True
+    state.cancel.set()
+    connection = interaction.guild.voice_client
+    if connection:
+        connection.stop()
+    await interaction.response.defer(ephemeral=True)
+    async with state.lock:
+        await disconnect_session(interaction.guild, state)
+    await interaction.edit_original_response(content="Бот вышел из голосового канала. Очередь очищена.")
+
+
+@app_commands.command(name="textchannel", description="Выбрать текстовый канал для автоматической озвучки")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(channel="Канал, новые сообщения из которого нужно озвучивать", disable="Выключить автоозвучку")
+async def textchannel(interaction: discord.Interaction, channel: discord.TextChannel | None = None,
+                      disable: bool = False):
+    if interaction.guild is None or not is_manager(interaction.guild, interaction.user):
+        await interaction.response.send_message("Нужно право «Управлять сервером».", ephemeral=True)
+        return
+    state = interaction.client.state(interaction.guild.id)
+    if channel is not None and disable:
+        await interaction.response.send_message("Выбери канал или отключение — один вариант.", ephemeral=True)
+        return
+    if channel is not None:
+        if channel.guild.id != interaction.guild.id or not channel.permissions_for(interaction.guild.me).view_channel:
+            await interaction.response.send_message("Выбери текстовый канал этого сервера, который виден боту.", ephemeral=True)
+            return
+        state.settings.set_text_channel(channel.id)
+        clear_message_queue(state)
+    elif disable:
+        state.settings.set_text_channel(None)
+        clear_message_queue(state)
+    if state.settings.text_channel_id is None:
+        result = "Автоозвучка сообщений выключена. Можно использовать /panel и /say."
+    else:
+        result = (f"Канал озвучки: <#{state.settings.text_channel_id}>. Пиши туда, находясь в голосовом канале. "
+                  "Доступ по роли сохраняется; сообщения ботов и вложения не озвучиваются.")
+        if not interaction.client.intents.message_content:
+            result += " Владелец бота должен включить Message Content Intent в Developer Portal и перезапустить бота."
+    await interaction.response.send_message(result, ephemeral=True)
 
 
 @app_commands.command(name="restore", description="Восстановить свой микрофон после сбоя бота")
@@ -418,6 +645,8 @@ async def panel(interaction: discord.Interaction):
 @restore.error
 @panel.error
 @access.error
+@leave.error
+@textchannel.error
 async def command_error(interaction, error):
     log.warning("Command failed (%s)", type(error).__name__)
     message = str(error) if isinstance(error, UserError) else "Команда не выполнена. Повтори её; проверь права и журнал хостинга."
@@ -427,6 +656,19 @@ async def command_error(interaction, error):
         await interaction.response.send_message(message, ephemeral=True)
 
 
+async def run_bot(token, data_dir, legacy_guild_id):
+    # Probe the official application flags before requesting a privileged intent.
+    # Slash commands remain usable when message-content access is not enabled.
+    async with discord.Client(intents=discord.Intents.none()) as probe:
+        await probe.login(token)
+        application = await probe.application_info()
+        content_enabled = (application.flags.gateway_message_content
+                           or application.flags.gateway_message_content_limited)
+    log.info("Text channel support: %s", "enabled" if content_enabled else "disabled in Developer Portal")
+    async with Speaker(data_dir, legacy_guild_id, message_content=content_enabled) as client:
+        await client.start(token)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     token = os.environ.get("DISCORD_TOKEN", "").strip()
@@ -434,8 +676,10 @@ def main():
         raise SystemExit("Set DISCORD_TOKEN in hosting Variables or the server configuration file.")
     # Old installations may retain GUILD_ID; it is used only to remove old guild commands.
     old_id = os.environ.get("GUILD_ID", "")
-    client = Speaker(os.environ.get("DATA_DIR", "data"), int(old_id) if old_id.isdecimal() else None)
-    client.run(token, log_handler=None)
+    try:
+        asyncio.run(run_bot(token, os.environ.get("DATA_DIR", "data"), int(old_id) if old_id.isdecimal() else None))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
