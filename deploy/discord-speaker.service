@@ -1,0 +1,20 @@
+[Unit]
+Description=Discord Speaker voice bot
+ConditionPathExists=%h/.config/discord-speaker/bot.env
+
+[Service]
+Type=simple
+WorkingDirectory=%h/apps/discord-speaker
+EnvironmentFile=%h/.config/discord-speaker/bot.env
+Environment=DATA_DIR=%h/.local/share/discord-speaker
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/apps/discord-speaker/.venv/bin/python %h/apps/discord-speaker/bot.py
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGINT
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
