@@ -78,6 +78,7 @@ class Speaker(discord.Client):
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.data_dir = Path(data_dir)
         self.states = {}
+        self.synced_guild_ids = set()
         self.legacy_guild_id = legacy_guild_id
         self.tree = app_commands.CommandTree(
             self, allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=False, private_channel=False),
@@ -123,8 +124,25 @@ class Speaker(discord.Client):
                 except Exception as exc:
                     log.warning("Recovery pending (%s). Use /restore after joining voice.", type(exc).__name__)
 
+    async def sync_guild_commands(self, guild):
+        if guild.id in self.synced_guild_ids:
+            return
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+        self.synced_guild_ids.add(guild.id)
+
+    async def on_guild_join(self, guild):
+        await self.sync_guild_commands(guild)
+
+    async def on_guild_remove(self, guild):
+        self.synced_guild_ids.discard(guild.id)
+
     async def on_ready(self):
         for guild in self.guilds:
+            try:
+                await self.sync_guild_commands(guild)
+            except discord.HTTPException as exc:
+                log.warning("Guild command refresh unavailable (%s); global commands remain registered", type(exc).__name__)
             try:
                 await self.recover(guild)
             except Exception as exc:

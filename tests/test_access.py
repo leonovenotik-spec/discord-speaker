@@ -151,6 +151,20 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sync.await_args_list[0].kwargs, {})
         self.assertEqual(sync.await_args_list[1].kwargs["guild"].id, 123)
 
+    async def test_join_registers_server_commands_without_repeating_on_reconnect(self):
+        guild = SimpleNamespace(id=123)
+        with patch.object(self.client.tree, "sync", new=AsyncMock()) as sync:
+            await self.client.setup_hook()
+            sync.reset_mock()
+            await self.client.on_guild_join(guild)
+            await self.client.sync_guild_commands(guild)
+            sync.assert_awaited_once_with(guild=guild)
+            self.assertEqual({command.name for command in self.client.tree.get_commands(guild=guild)},
+                             {"say", "stop", "restore", "panel", "access"})
+            await self.client.on_guild_remove(guild)
+            await self.client.on_guild_join(guild)
+            self.assertEqual(sync.await_count, 2)
+
     async def test_commands_are_server_installed_and_access_is_manager_only(self):
         with patch.object(self.client.tree, "sync", new=AsyncMock()):
             await self.client.setup_hook()
