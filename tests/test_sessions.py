@@ -180,6 +180,43 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(state.message_queue.join(), 2)
         self.assertEqual([call.args[3] for call in speech.await_args_list], ["Один", "Два"])
 
+    async def test_text_messages_from_multiple_people_use_their_own_voice_and_mute(self):
+        first, connection, state = self.session()
+        second = self.interaction(user_id=777)
+        second.guild = first.guild
+        second.user.guild = first.guild
+        second.user.voice = SimpleNamespace(channel=connection.channel, mute=False)
+        members = {first.user.id: first.user, second.user.id: second.user}
+        first.guild.fetch_member.side_effect = lambda user_id: members[user_id]
+        state.settings.set_text_channel(555)
+        state.member(second.user.id).preferences.set(voice="ru-RU-SvetlanaNeural")
+        with patch.object(bot, "play_audio", new=AsyncMock()) as playback, \
+             patch.object(bot.edge_tts, "Communicate", return_value=SimpleNamespace(save=AsyncMock())) as tts:
+            messages = [self.message(first, "Первый"), self.message(second, "Второй")]
+            for message in messages:
+                await self.client.on_message(message)
+            await asyncio.wait_for(state.message_queue.join(), 2)
+        self.assertEqual(playback.await_count, 2)
+        self.assertEqual([call.args[0] for call in tts.call_args_list], ["Первый", "Второй"])
+        self.assertEqual(tts.call_args_list[1].kwargs["voice"], "ru-RU-SvetlanaNeural")
+        for member in members.values():
+            self.assertEqual([call.kwargs["mute"] for call in member.edit.await_args_list], [True, False])
+        for message in messages:
+            message.reply.assert_not_awaited()
+        self.assertEqual(state.session_owner_id, first.user.id)
+        connection.disconnect.assert_not_awaited()
+
+    async def test_person_outside_voice_gets_an_explanation_with_session_channel(self):
+        first, connection, state = self.session()
+        state.settings.set_text_channel(555)
+        other = self.interaction(user_id=777)
+        other.guild = first.guild
+        message = self.message(other)
+        await self.client.on_message(message)
+        message.reply.assert_awaited_once()
+        self.assertIn(f"<#{connection.channel.id}>", message.reply.await_args.args[0])
+        self.assertIsNone(state.worker_task)
+
     async def test_unauthorized_roles_bots_webhooks_and_other_channels_are_ignored(self):
         interaction, connection = self.voice_interaction()
         state = self.client.state(123)

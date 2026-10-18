@@ -354,10 +354,17 @@ class Speaker(discord.Client):
         if state.session_ending:
             return
         text = message.clean_content.strip()
-        if not text or not can_speak(message.guild, message.author, state.settings):
+        if not text:
+            return
+        if not can_speak(message.guild, message.author, state.settings):
+            await self.reply_message_error(message, "Для озвучки нужна роль, выбранная администратором сервера.")
             return
         channel = message.author.voice.channel if message.author.voice else None
         if not isinstance(channel, discord.VoiceChannel):
+            destination = (f"Зайди в голосовой канал <#{state.session_channel_id}>, чтобы озвучить сообщение."
+                           if state.session_channel_id is not None else
+                           "Зайди в обычный голосовой канал и повтори сообщение — бот подключится к тебе.")
+            await self.reply_message_error(message, destination)
             return
         if len(text) > 500:
             await self.reply_message_error(message, "Для озвучки напиши не более 500 символов.")
