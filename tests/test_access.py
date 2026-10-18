@@ -144,12 +144,18 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reopened.state(123).member(777).journal.read()["user"], 777)
         self.assertFalse(path.exists())
 
-    async def test_global_sync_and_legacy_cleanup(self):
+    async def test_old_global_commands_are_removed_before_server_templates_load(self):
         client = bot.Speaker(self.temp.name, legacy_guild_id=123)
-        with patch.object(client.tree, "sync", new=AsyncMock()) as sync:
+        published = []
+        async def capture_sync(*, guild=None):
+            published.append((guild, [command.name for command in client.tree.get_commands(guild=guild)]))
+        with patch.object(client.tree, "sync", new=AsyncMock(side_effect=capture_sync)) as sync:
             await client.setup_hook()
         self.assertEqual(sync.await_args_list[0].kwargs, {})
         self.assertEqual(sync.await_args_list[1].kwargs["guild"].id, 123)
+        self.assertEqual(published[0], (None, []))
+        self.assertEqual(published[1][1], [])
+        self.assertEqual(len(client.tree.get_commands()), 5)
 
     async def test_join_registers_server_commands_without_repeating_on_reconnect(self):
         guild = SimpleNamespace(id=123)

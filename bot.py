@@ -102,17 +102,19 @@ class Speaker(discord.Client):
             legacy.path.replace(legacy.path.with_suffix(".migrated"))
 
     async def setup_hook(self):
+        # Remove obsolete global commands before loading local templates. Commands
+        # are published only per guild, so Discord cannot show both scope copies.
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()
         for command in (say, stop, restore, panel, access):
             self.tree.add_command(command)
-        # Global registration makes commands available wherever the bot is installed.
-        await self.tree.sync()
         if self.legacy_guild_id:
             old_guild = discord.Object(id=self.legacy_guild_id)
             self.tree.clear_commands(guild=old_guild)
             try:
                 await self.tree.sync(guild=old_guild)
             except discord.HTTPException:
-                log.warning("Could not remove legacy guild commands; global commands are registered")
+                log.warning("Could not remove legacy guild commands; they will be refreshed on ready")
 
     async def recover(self, guild):
         state = self.state(guild.id)
@@ -142,7 +144,7 @@ class Speaker(discord.Client):
             try:
                 await self.sync_guild_commands(guild)
             except discord.HTTPException as exc:
-                log.warning("Guild command refresh unavailable (%s); global commands remain registered", type(exc).__name__)
+                log.warning("Guild command refresh unavailable (%s); will retry on reconnect", type(exc).__name__)
             try:
                 await self.recover(guild)
             except Exception as exc:
